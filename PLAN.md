@@ -1,359 +1,269 @@
-# Math Answer-Key Verifier — Project Plan
+# Math Answer-Key Verifier — Project Plan (v2)
 
 ## 1. Goal
 
-Users drop in a textbook or worksheet (`.pdf` or `.docx`). The program:
+A free program that runs on your own computer. You drop in a **digital PDF** (or `.docx`) of a math book or worksheet, pick which pages to check (or all), and the program:
 
-1. Pulls out every problem on the pages the user picks (or all pages).
-2. Finds the answer key, usually at the back of the book, and matches each key entry to its problem.
+1. Pulls every problem off the selected pages.
+2. Reads the answer key at the back of the book and matches each key entry to its problem.
 3. Solves each problem on its own, without looking at the key.
-4. Compares its answer with the key's answer.
-5. For each mismatch, says **exactly what is wrong and what it should change to**, with a worked solution.
+4. Compares its answer with the key.
+5. For every mismatch, reports **what is wrong** and **on which page**: the problem's page and the key entry's page.
 
-**Accuracy matters most.** When the program isn't sure, it says so and flags the item for human review. It never presents a guess as a finding.
+**Accuracy matters most.** If the program can't verify a problem with confidence, it says "Needs review". It never guesses.
 
-**Nice to have:** write the corrections into the `.docx` (as tracked changes) and export the corrected document to PDF.
+**Decisions so far**
 
-### Subjects in scope
-
-| Group | Courses |
+| Topic | Decision |
 |---|---|
-| Elementary / middle | Grades K–8 (arithmetic, fractions, decimals, ratios, percents, basic geometry, pre-algebra, intro stats) |
-| High school | Algebra 1, Geometry, Algebra 2, Precalculus |
-| AP | Calculus AB, Calculus BC, AP Statistics |
-| College | Calculus 1, Calculus 2, Calculus 3 (multivariable), Differential Equations |
+| Where it runs | Your own computer, as a local web page (opens in your browser at `localhost`). No hosting, no account |
+| Cost | **No paid APIs.** All solving runs locally with free, open-source tools |
+| Input | Digital PDFs (with real, selectable text). `.docx` is also supported. Scanned books are out of scope for now |
+| Equivalent answers | `1/2`, `0.5`, `.5`, and `50%` (where a percent makes sense) all count as **equal**. So do other equivalent forms, like `(x+1)²` = `x²+2x+1` |
+| Corrections | **Out of scope.** The program reports problems; it does not edit files |
+
+**Courses:** Grades K–8, Algebra 1, Geometry, Algebra 2, Precalculus, Calculus AB, Calculus BC, AP Statistics, Calculus 1, Calculus 2, Calculus 3, Differential Equations.
 
 ---
 
-## 2. Core design principle: solve it two ways and agree
+## 2. How solving works without a paid AI
 
-One solver can't be trusted for accuracy. Each problem goes through **independent paths**, and the system only reports a confident verdict when they agree:
+Ruling out the Claude API changes the design. The core becomes **computer algebra (SymPy/SciPy)**, which is exact and fully trustworthy once a problem has been translated into math correctly. The hard part is the *translation*: turning book text into something SymPy can run.
+
+Problems are routed through tiers, from most reliable to least:
 
 ```
-            ┌──────────────────────┐
-problem ──▶ │ A. LLM reasoning     │──▶ answer A ─┐
-            │    solve (run ×N)    │              │
-            ├──────────────────────┤              ├─▶ consensus ─▶ compare with key ─▶ verdict
-            │ B. CAS / numeric     │──▶ answer B ─┤
-            │    solve (SymPy,     │              │
-            │    SciPy, etc.)      │              │
-            ├──────────────────────┤              │
-            │ C. Back-substitution │──▶ check  ───┘
-            │    verify key answer │
-            └──────────────────────┘
+problem text
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ Tier 1: Rule-based parsing (no AI)      │  "Solve 3x − 7 = 11", "Find dy/dx if y = x²sin x",
+│ instruction pattern + math expression   │  "Evaluate ∫₀² x³ dx", "Simplify (x²−9)/(x−3)"
+│ → SymPy → exact answer                  │  Expected to cover most drill/practice problems
+└────────────────┬────────────────────────┘
+                 │ can't parse
+                 ▼
+┌─────────────────────────────────────────┐
+│ Tier 2: Local AI translator (optional)  │  Word problems, geometry with given values,
+│ free open-source model on your computer │  stats scenarios. The AI only WRITES the setup
+│ (via Ollama) → SymPy code → run it      │  (equations/code). SymPy computes the answer.
+└────────────────┬────────────────────────┘
+                 │ can't translate confidently
+                 ▼
+┌─────────────────────────────────────────┐
+│ Tier 3: Needs human review              │  Proofs, "explain", sketch-a-graph, problems
+│ shown with page, problem, and key answer│  that depend on a picture the program can't read
+└─────────────────────────────────────────┘
 ```
 
-- **A. LLM solver** (Claude via the Anthropic API): reads the problem as given, including diagrams, solves it step by step, and returns a structured final answer. It runs several times on its own (self-consistency); answers that don't agree across runs lower confidence.
-- **B. Computer algebra / numeric solver:** the LLM translates the problem into executable SymPy/SciPy code, and the code is run in a sandbox. This gives an exact or high-precision answer that doesn't depend on the LLM's arithmetic.
-- **C. Direct verification of the key:** whenever possible, check the *key's* answer directly. Plug roots back into the equation, differentiate an antiderivative, substitute a DE solution into the equation, check a probability sums to 1, and so on. This is often the strongest evidence of all.
+### Tier 1: rule-based parsing (the reliable core)
+- Detect the **instruction** ("Solve", "Simplify", "Factor", "Evaluate", "Find the derivative", "Integrate", "Find the limit", "Find the slope", …), including instructions written once above a group of problems ("Solve each equation. Round to the nearest tenth.").
+- Parse the **math expression** into SymPy using `sympy.parsing` (plain-text math) and `latex2sympy2` (for math rebuilt as LaTeX; see §4).
+- Map instruction → SymPy operation (`solveset`, `simplify`, `factor`, `diff`, `integrate`, `limit`, `dsolve`, `Matrix` ops, etc.).
+- Fully deterministic and repeatable. No AI is involved, so no AI mistakes.
 
-**When the program flags a key answer as wrong:** at least two independent paths must agree with each other and disagree with the key, and path C (where it applies) must show the key fails. Anything less goes to "Needs review", not "Key is wrong".
+### Tier 2: local AI translator (optional, free)
+- Runs a free open-source math model on your computer through **Ollama** (candidates to compare: Qwen2.5-Math-7B, Qwen3-8B, DeepSeek-R1-Distill-Qwen-7B; we choose based on our own benchmark).
+- The AI is **never trusted for the answer**. It only writes the setup (equations or SymPy code); SymPy does the arithmetic.
+- Safety checks on what the AI produces:
+  - Run the translation **3 times**. If the setups give different answers → Needs review.
+  - Plug the result back into the problem's stated conditions where possible.
+  - The key is only flagged wrong if the translated setup is consistent *and* the key fails a direct check (below).
+- **Hardware:** roughly 8 GB of free RAM (16 GB recommended). A GPU makes it faster but isn't required. If your computer can't run it, Tier 2 is skipped and those problems go to Needs review. The rest of the program works normally.
+
+### Direct check of the key's answer (any tier)
+Whenever possible, the program checks the **key's** answer directly instead of only comparing it with its own:
+- Plug roots into the equation; test points for inequalities.
+- Differentiate the key's antiderivative and compare with the integrand.
+- Substitute the key's DE solution into the equation and the initial conditions (`checkodesol`).
+- Expand the key's factored form; evaluate the key's limit numerically.
+
+**When a key is reported wrong:** the program's answer must come from a successful solve, the key's answer must *fail* the direct check (where one exists), and the equivalence engine (§6) must confirm the two really differ. Otherwise the problem goes to "Needs review".
 
 ---
 
 ## 3. Verdicts
 
-Every problem gets exactly one verdict:
-
-| Verdict | Meaning | Shown to user as |
-|---|---|---|
-| ✅ **Correct** | Key matches the verified answer, allowing for equivalent forms | Green |
-| ❌ **Key is wrong** | High-confidence mismatch; paths agree and the key fails verification | Red, with a correction |
-| ⚠️ **Key incomplete / mis-formatted** | Partly right, e.g. one of two roots missing, wrong rounding, missing units, missing `+ C` | Orange, with a correction |
-| 🔍 **Needs human review** | Solvers disagree, the problem is ambiguous, or the answer type can't be checked automatically (proofs, sketches) | Yellow, with reasoning |
-| ➖ **No key entry** | Problem has no answer in the key (e.g. the key covers odd problems only) | Gray. Still solved, but not compared |
-| ⛔ **Could not parse** | Extraction failed (unreadable scan, figure not captured) | Gray, with the page image |
-
----
-
-## 4. "What exactly is wrong": report format
-
-Each ❌ or ⚠️ item includes:
-
-- **Location:** page number (printed *and* PDF index), section, problem number, and the key's page and line.
-- **Problem text**, rendered as LaTeX/MathJax, plus a cropped image of the original.
-- **Key says:** the key's answer exactly as printed.
-- **Correct answer:** in the same style and format as the book (e.g. if the book writes `x = 3/2`, don't answer `1.5`).
-- **What's wrong:** a specific diagnosis, e.g.:
-  - "Sign error: the key gives `x = −4`, but substituting gives `2(−4)+3 = −5 ≠ 11`. The solution is `x = 4`."
-  - "Missing solution: `x² = 9` has two solutions, `x = ±3`. The key lists only `x = 3`."
-  - "Rounding: the book's instructions say to round to the nearest tenth. `12.47 → 12.5`, not `12.4`."
-  - "Answer belongs to a different problem: the key's #14 answer matches problem #15. Keys for #14–#20 may be shifted by one."
-- **Change to:** the exact replacement text for the key entry.
-- **Worked solution:** the steps that lead to the correct answer.
-- **Evidence and confidence:** which paths agreed, the verification results, and a confidence score.
-
-**Pattern detection across problems:** the program looks for systematic errors, such as a key shifted by one problem, a whole section keyed to the wrong edition, or rounding applied in the wrong place everywhere. It reports these once as a group instead of 20 separate errors.
-
-Output formats: an interactive HTML report in the app, plus downloadable **PDF**, **DOCX**, and **CSV/JSON** versions.
-
----
-
-## 5. System architecture
-
-```
-┌──────────────┐   ┌──────────────┐   ┌───────────────┐   ┌─────────────┐   ┌──────────────┐
-│ 1. Ingest    │──▶│ 2. Structure │──▶│ 3. Align with │──▶│ 4. Solve &  │──▶│ 5. Compare & │
-│ PDF / DOCX   │   │ problems &   │   │ answer key    │   │ verify      │   │ report       │
-│ → pages+math │   │ key entries  │   │               │   │             │   │              │
-└──────────────┘   └──────────────┘   └───────────────┘   └─────────────┘   └──────┬───────┘
-                                                                                    │ (optional)
-                                                                            ┌───────▼────────┐
-                                                                            │ 6. Apply fixes │
-                                                                            │ DOCX → PDF     │
-                                                                            └────────────────┘
-```
-
-### Tech stack (recommended)
-
-| Layer | Choice | Why |
-|---|---|---|
-| Language | **Python 3.12** | Best ecosystem for math (SymPy, SciPy, statsmodels) and documents |
-| Backend API | **FastAPI** | Async, easy file uploads, streams progress |
-| Job queue | **Celery + Redis** (or RQ) | A 600-page book takes minutes; run jobs in the background with progress updates |
-| Frontend | **React + TypeScript**, MathJax/KaTeX for math, PDF.js for page previews | Drag-and-drop, page picker, side-by-side review |
-| PDF | **PyMuPDF** (text, layout, page rendering) | Fast, gives positions, renders crops |
-| DOCX | **python-docx** + raw OOXML handling for equations (OMML) | Equations in Word are OMML and need conversion to LaTeX |
-| Math OCR | **Claude vision**, with optional **Mathpix** as a second reader | Scanned pages and equations stored as images |
-| LLM | **Claude (Opus-class for solving, cheaper model for extraction/triage)** via Anthropic API | Strong math reasoning plus vision |
-| CAS | **SymPy**, **SciPy**, **NumPy**, **mpmath** (high precision), **statsmodels** for stats | Exact, checkable answers |
-| Code sandbox | Isolated subprocess / container with time and memory limits, no network | Runs LLM-generated CAS code safely |
-| DOCX → PDF | **LibreOffice headless** (`soffice --convert-to pdf`) | Free and dependable; preserves layout well |
-| Storage | SQLite (single user) → Postgres (multi-user) | Jobs, problems, verdicts, user overrides |
-
-Deployment: start as a **local web app** (run on the user's machine, open `localhost`) so textbooks never leave the machine except for API calls. A Docker image bundles LibreOffice and the Python stack.
-
----
-
-## 6. Pipeline details
-
-### 6.1 Ingestion
-
-**PDF**
-- Extract text with positions using PyMuPDF.
-- Check each page: is there a real text layer? If the page is scanned or text is garbled, render it to an image (300 DPI) and run math OCR.
-- Equations are often broken in PDF text layers (fractions split across lines, missing symbols). **Policy:** any problem with math gets a vision pass over a cropped image of that problem, and the vision transcript is checked against the text layer. Disagreements are flagged.
-- Extract figures (diagrams, graphs, tables) as images tied to their problems. Geometry and calculus problems often depend on them.
-
-**DOCX**
-- Walk the document body in order: paragraphs, tables, numbered lists, images.
-- Convert OMML equations to LaTeX (via the standard OMML→MathML XSLT, then MathML→LaTeX).
-- Rebuild automatic list numbering (Word stores "1., 2., 3." as list formatting, not text). Problem numbers depend on this.
-- Record a **location anchor** for each problem and key entry (paragraph index and run range). The fix-applying feature needs these.
-- Page numbers: `.docx` has no fixed pages. Render to PDF with LibreOffice to map content to page numbers for the page picker.
-
-### 6.2 Page selection
-
-- UI shows page thumbnails. The user picks **All pages**, ranges (`12–30, 45, 51–60`), or chapters/sections from a detected table of contents.
-- Accept **both** printed page numbers ("p. 47" in the book) and PDF page indices. Detect the offset between them automatically by reading the printed page numbers, and show both.
-- Detect the answer key section automatically (headings like "Answers", "Selected Answers", "Answer Key", "Solutions"; dense numbered short answers; usually the last 10–20% of the book). The user can confirm it or set its page range by hand.
-- Only selected problem pages get solved. The answer key pages are always parsed (only the relevant entries are used).
-
-### 6.3 Structuring problems
-
-The LLM (with layout info and page images) turns each page into structured records:
-
-```json
-{
-  "id": "ch3.sec2.ex17b",
-  "chapter": "3", "section": "3.2", "exercise_set": "Practice",
-  "number": "17", "part": "b",
-  "page_printed": 147, "page_index": 163,
-  "instructions": "Solve. Round to the nearest tenth if necessary.",
-  "text_latex": "3x^2 - 5x - 7 = 0",
-  "figures": ["fig_163_2.png"],
-  "shared_context": "Use the table for Exercises 15–20.",
-  "answer_type": "set_of_reals",
-  "course_hint": "algebra1"
-}
-```
-
-Points to get right:
-- **Instructions are inherited.** "Solve each equation. Round to the nearest hundredth." applies to every problem below it, and it changes what counts as correct.
-- **Shared context:** "Use the graph for Exercises 5–9" has to be attached to each of those problems.
-- **Multi-part problems** (a, b, c) get separate entries.
-- **Problem types:** compute / solve / simplify / prove / graph / explain / multiple choice / true-false. Proofs, "explain", and graphing problems go to a special track (§6.6).
-
-### 6.4 Answer key parsing and alignment
-
-- Parse key entries into `(chapter, section, exercise set, number, part) → answer`.
-- Handle common layouts: multiple columns, "odd answers only", section headers like "Lesson 3-2", answers that run across columns or pages, answers that are graphs (images).
-- **Alignment check:** after matching, look for signs the matching is off: a run of mismatches that would all become matches if shifted by one, or a key section whose answers don't fit the problem types. If found, re-align or flag it.
-- Record the key entry's location (page and position) for reporting and editing.
-
-### 6.5 Solving and verification by course
-
-The solver picks strategies using a course/topic classifier. Each answer type has an **equivalence checker** (§6.7).
-
-| Course | Typical problems | CAS / numeric path | Direct key verification |
-|---|---|---|---|
-| **K–8** | Arithmetic, fractions, decimals, percents, ratios, unit conversion, area/perimeter, mean/median/mode, word problems | Exact rationals (`fractions.Fraction`, SymPy `Rational`), `pint` for units | Recompute exactly. Word problems: LLM sets up the equation, CAS solves it, and the setup is checked by a second independent LLM run |
-| **Algebra 1** | Linear equations/inequalities, systems, slope, functions, exponents, polynomials, factoring, quadratics, radicals | `solve`, `solveset`, `factor`, `expand`, `linsolve`, `reduce_inequalities` | Substitute roots; expand factored forms and compare; test points for inequalities |
-| **Geometry** | Angles, triangles, similarity, Pythagorean theorem, trig ratios, circles, area/volume, coordinate geometry, transformations, proofs | SymPy geometry module, trig solve; numeric solve with constraints from the figure | Check the figure's constraints are satisfied (angle sums, side lengths). Proofs → review track |
-| **Algebra 2** | Polynomials, rational functions, exponentials/logs, sequences/series, complex numbers, matrices, conics, probability | `solveset` over ℂ, `apart`, log rules, `Matrix`, summation | Substitute, including complex roots; check domain restrictions (extraneous roots) |
-| **Precalculus** | Trig identities and equations, inverse trig, polar/parametric, vectors, limits (intro), conics | `trigsimp`, general solutions with periodicity, `nsolve` | Trig equations: check the key's solution set *and* the requested interval (e.g. `[0, 2π)`). Identities: symbolic plus numeric random-point test |
-| **Calc AB / Calc 1** | Limits, derivatives, implicit differentiation, related rates, optimization, integrals, FTC, area/volume | `limit`, `diff`, `integrate`, `idiff`, numeric quadrature (mpmath) | Differentiate the key's antiderivative; numeric checks of limits and definite integrals; check critical points |
-| **Calc BC / Calc 2** | Integration techniques, improper integrals, series convergence, Taylor/Maclaurin, polar/parametric calculus | `integrate`, `series`, `summation`, convergence tests, numeric partial sums | Compare Taylor coefficients; numeric checks of improper integrals; convergence by more than one test |
-| **AP Stats** | Descriptive stats, regression, probability, distributions, sampling, confidence intervals, hypothesis tests | SciPy/statsmodels; exact binomial/normal/t/χ² computations | Recompute from the data. **Match the book's convention** (table vs calculator values, z vs t, pooled vs unpooled, rounding of intermediate steps); a tolerance band accounts for table-based answers |
-| **Calc 3** | Vectors, partial derivatives, gradients, multiple integrals, line/surface integrals, Green/Stokes/divergence | SymPy vector module, iterated `integrate`, numeric cubature | Compute double/triple integrals in two orders or coordinate systems; check the theorem both ways (e.g. a line integral vs Green's double integral) |
-| **Diff Eqs** | Separable, linear, exact, 2nd-order linear, undetermined coefficients, variation of parameters, Laplace, systems, series solutions | `dsolve`, `laplace_transform`, `Matrix.exp`, numeric ODE (`solve_ivp`) | **Substitute the key's solution into the ODE** (`checkodesol`) and check initial conditions; compare with a numeric solution |
-
-### 6.6 Problems that can't be checked by computation
-
-- **Proofs / "show that" / "explain":** an LLM grader checks the key's argument against a rubric, and these always come out as 🔍 *Needs review* with notes. The "show that" *claim itself* can still be checked by CAS.
-- **Graphs / sketches in the key:** extract key features from the image (intercepts, asymptotes, shading, open/closed points) with vision and compare with computed features. Report as ⚠️ or 🔍, never ❌, unless a specific feature is clearly wrong (e.g. the key shades the wrong side of an inequality).
-- **Free-response stats interpretation** ("interpret the slope in context"): rubric check, 🔍 only.
-
-### 6.7 Answer equivalence engine (key to accuracy)
-
-Most false alarms come from treating two correct forms as different. The comparison layer must recognize equivalent answers:
-
-| Answer type | Equivalence rule |
+| Verdict | Meaning |
 |---|---|
-| Number | Exact equality for exact answers; for decimals, compare at the book's stated rounding (from the instructions). Accept `0.5 = 1/2 = 50%` *only* if the instructions allow either format; otherwise report a format issue (⚠️) |
-| Expression | `simplify(a − b) == 0`, **plus** numeric checks at 20+ random points (including complex points), to catch both SymPy false negatives and false positives |
-| Equation | Same solution set, or one is a nonzero multiple of the other (for lines, conics) |
-| Solution set | Set equality (order doesn't matter); count multiplicity only if asked |
-| Interval / inequality | Normalize to interval notation; compare endpoints and open/closed |
-| Ordered pair / tuple / vector | Element-wise equivalence (order matters) |
-| Matrix | Element-wise; for eigenvectors, equality up to scaling |
-| Indefinite integral | Derivative of the key equals the integrand, and the key includes `+ C`. Differing by a constant counts as equivalent |
-| General solution of a DE | Satisfies the ODE and spans the same solution family (arbitrary constants may be relabeled or combined) |
-| Trig equation solutions | Same set over the stated interval, or the same general solution modulo the period |
-| Units | Convert with `pint`; wrong or missing units → ⚠️ |
-| Multiple choice | Letter, **and** check the letter's option content (catches keys pointing to the wrong letter) |
-| Stats values | Tolerance tied to the method (table vs software); report the book's convention |
-
-Every equivalence decision is logged with the method used, so a human can check the reasoning.
-
-### 6.8 Confidence scoring
-
-Inputs: agreement among LLM runs, agreement between the LLM and CAS, the key-verification result, extraction quality (OCR vs text-layer agreement), and problem-type risk (word problems and figure-dependent problems are higher risk).
-
-- High confidence plus mismatch → ❌
-- Medium confidence, or any path disagrees → 🔍
-- On 🔍, escalate automatically first: more LLM runs, a stronger model, different CAS formulations. Only items still unresolved stay 🔍.
-
-Thresholds get tuned on the test set (§9) so that **precision on ❌ is at least 99%**. A false "your key is wrong" is the worst failure.
+| ✅ **Correct** | Key matches the computed answer (any equivalent form) |
+| ❌ **Key is wrong** | Confident mismatch. Report gives the specifics and pages |
+| ⚠️ **Key is incomplete** | Partly right: missing a solution, wrong rounding, missing `+ C`, missing units |
+| 🔍 **Needs review** | Couldn't verify confidently (proof, graph, ambiguous wording, solvers disagree) |
+| ➖ **No key entry** | Problem has no answer in the key (e.g. odd answers only). Still solved and listed |
+| ⛔ **Couldn't read** | Text extraction failed for that problem |
 
 ---
 
-## 7. User interface
+## 4. Reading digital PDFs
 
-1. **Upload screen:** drag-and-drop `.pdf` / `.docx`, with optional settings:
-   - Course / grade level (auto-detected; the user can override)
-   - Pages to check: **All** or a custom range / chapter picker with thumbnails
-   - Answer key location: auto-detect or a manual page range
-   - Strictness: whether equivalent forms count as correct, or whether the format must match the book
-2. **Progress view:** live status for each page and problem (extracting → solving → verifying).
-3. **Results dashboard:** summary counts by verdict; filter by verdict, chapter, or course topic.
-4. **Problem detail (side by side):** original page crop | extracted problem | key answer | computed answer | diagnosis | worked solution | evidence.
-5. **Human review controls:** for each item, *Accept correction*, *Reject (key is right)*, or *Edit correction*. These decisions feed into the export and into the test set.
-6. **Export:** PDF/DOCX/CSV report, and (nice-to-have) a corrected document.
+Digital PDFs have a text layer, but math is often stored awkwardly: fractions as two lines stacked up, exponents as smaller raised text, symbols in special fonts. Plan:
 
----
+1. **PyMuPDF** extracts every character with its **position, font, and size**.
+2. A **math rebuild step** uses that layout information:
+   - Smaller, raised text → exponent (`x2` with a raised "2" → `x^2`)
+   - Lowered text → subscript
+   - Text stacked above and below a horizontal line → fraction
+   - Symbol-font characters mapped to real symbols (√, ∫, π, θ, ≤, …)
+   - Radical signs with an overline → square root
+3. **Cross-check with a free local math OCR model** (e.g. `pix2tex` / LaTeX-OCR, or the Texify/Marker models): render the problem as an image and read the math a second way. If the two readings disagree mathematically → the problem is marked ⛔/🔍 instead of being solved from possibly wrong text. This is the main protection against reading errors.
+4. Figures (graphs, triangles, tables) are saved as images and linked to their problems. Tables of numbers (common in stats) are extracted as data.
 
-## 8. Nice-to-have: apply fixes to DOCX and convert to PDF
-
-### 8.1 Editing the DOCX
-- Use the location anchors from ingestion (§6.1) to find each key entry's paragraph and run range.
-- Two modes:
-  - **Tracked changes (default):** insert `<w:del>` / `<w:ins>` revision marks with an author like "Answer Key Verifier" and a Word comment holding the explanation. The author can accept or reject each change in Word.
-  - **Clean replace:** overwrite directly, keeping run formatting (font, size, bold, etc.).
-- **Equations:** if the key answer is an OMML equation, generate replacement OMML (LaTeX → MathML → OMML) so it still displays as an equation.
-- Only apply changes the user accepted (or all ❌ items with "auto-apply high confidence" turned on).
-- After editing, re-open and re-parse the document to confirm every change landed and nothing else changed (compare the before/after text outside the edited ranges).
-
-### 8.2 PDF inputs
-Editing a PDF directly isn't reliable. Options:
-- Make an **annotated PDF**: red strike-through on the wrong key answer plus a sticky note or callout with the correction (PyMuPDF annotations). Simple and reliable.
-- Or convert the PDF to DOCX (e.g. `pdf2docx`), apply the fixes, then convert back. This is lossy for complex layouts, so it's opt-in with a warning.
-
-### 8.3 DOCX → PDF
-- `soffice --headless --convert-to pdf corrected.docx`, bundled in the Docker image.
-- Optionally, Microsoft Word automation on Windows for perfect fidelity, when available.
+**`.docx` files:** read with `python-docx`. Word equations (OMML) are converted to LaTeX, then to SymPy. Word's automatic numbering is rebuilt so problem numbers are correct. Page numbers come from rendering the `.docx` to PDF with LibreOffice (only used to label pages).
 
 ---
 
-## 9. Proving accuracy: testing and evaluation
+## 5. Pages, problems, and the answer key
 
-Accuracy is the main requirement, so testing is part of the build, not an add-on.
+### Page selection
+- The page shows thumbnails of the uploaded PDF. Choose **All pages** or type ranges like `12-30, 45, 51-60`.
+- The program reads the **printed page numbers** (the numbers in the book's corners) and works out the difference from the PDF's page count. Both are shown everywhere: *"Page 147 (PDF page 163)"*.
+- The answer key section is found automatically (headings like "Answers", "Selected Answers", "Answer Key"). You can confirm it or type its page range.
 
-1. **Benchmark set:** 50+ real books and worksheets spread across all 12 courses (public/OER texts such as OpenStax for Algebra–Calculus and Statistics, plus user-supplied ones).
-2. **Ground truth:** humans check a sample of problems per book.
-3. **Seeded-error tests:** take correct keys and inject realistic errors (sign flips, missing roots, wrong rounding, swapped answers, missing `+C`, off-by-one alignment, wrong letter in multiple choice, units). Measure detection rate.
-4. **Equivalence tests:** thousands of pairs of equivalent forms that must *not* be flagged (e.g. `(x+1)²` vs `x²+2x+1`, `ln(x²)` vs `2ln|x|` with domain care, `sin²x` vs `1−cos²x`, alternate antiderivatives, DE general-solution forms).
-5. **Metrics, tracked for each course:**
-   - **❌ precision** (target ≥ 99%): of the items flagged wrong, how many truly are
-   - **❌ recall** (target ≥ 95%): of the truly wrong keys, how many are caught
-   - **Extraction accuracy**: problems and key entries correctly captured
-   - **Review rate**: share of items sent to 🔍 (keep it low without losing precision)
-6. **Regression suite** in CI: every change reruns the benchmark; precision may not drop.
-7. Human review decisions from the UI (§7.5) go back into the benchmark.
+### Problem extraction
+Each problem is stored with: chapter/section, problem number and part (17b), **printed page and PDF page**, the instruction that applies to it, the math, any shared context ("Use the table for Exercises 15–20"), and linked figures.
+
+### Answer key matching
+- Key entries are parsed into `(section, problem number, part) → answer`, with the **key's page number** recorded.
+- Handles multi-column keys, odd-only keys, and answers that continue onto the next column or page.
+- **Shift detection:** if a run of answers would all match after shifting by one problem, the program reports *"Answers for Section 3.2, #14–20 appear shifted by one"* once, instead of seven separate errors.
 
 ---
 
-## 10. Project structure
+## 6. Comparing answers (equivalence engine)
+
+This is what stops false alarms. Two answers are treated as **equal** when:
+
+| Answer type | Rule |
+|---|---|
+| Numbers | Same value: `1/2 = 0.5 = .5 = 50%`. Decimals are compared at the book's rounding instruction (e.g. "nearest tenth"), otherwise within a small tolerance for rounded values |
+| Expressions | `simplify(a − b) = 0`, **and** the two agree at 20+ random points (catches SymPy mistakes in both directions) |
+| Equations | Same solutions, or one equation is a multiple of the other |
+| Solution sets | Same set, any order (`x = 3, −3` = `x = ±3`) |
+| Inequalities / intervals | Same set (`x > 2` = `(2, ∞)`), including open vs. closed endpoints |
+| Points, vectors | Same coordinates in order |
+| Matrices | Same entries (eigenvectors: equal up to scaling) |
+| Indefinite integrals | Key's derivative equals the integrand. Differing by a constant is fine. Missing `+ C` → ⚠️ |
+| Trig equations | Same solutions on the requested interval, or the same general solution |
+| DE general solutions | Satisfies the equation; constants may be renamed or combined |
+| Units | Converted with `pint` (`12 in` = `1 ft`). Missing or wrong units → ⚠️ |
+| Multiple choice | Letter matches. Also checks that the option's content is the correct answer |
+| Stats | Small tolerance for table-vs-calculator differences (e.g. z-table rounding) |
+
+---
+
+## 7. The report: specific and page-exact
+
+Each ❌ / ⚠️ item looks like:
+
+> **❌ Page 147 (PDF 163) — Section 3.2, Problem 17b**
+> **Problem:** Solve 2x + 3 = 11
+> **Key (page 612, PDF 628) says:** x = −4
+> **Correct answer:** x = 4
+> **What's wrong:** Sign error. Substituting the key's answer: 2(−4) + 3 = −5, not 11. Substituting x = 4: 2(4) + 3 = 11 ✓.
+> **Steps:** 2x + 3 = 11 → 2x = 8 → x = 4
+
+The "What's wrong" line names the **type** of error whenever it can be identified:
+- Sign error, arithmetic error, or wrong value (with the substitution check shown)
+- Missing solution(s), e.g. "x² = 9 also has x = −3", or extra/extraneous solution(s)
+- Rounding error ("12.47 rounds to 12.5, not 12.4")
+- Missing `+ C`, missing units, wrong endpoint (open vs. closed)
+- Answer belongs to a different problem / key shifted
+- Wrong multiple-choice letter (the letter given is option B = 7, but the answer is 9 = option D)
+
+**Summary at the top:** number of problems checked, counts for each verdict, and a list of every error by page. Results can be downloaded as **PDF** or **CSV**.
+
+---
+
+## 8. Strategy by course
+
+| Course | Main problem types | How they're verified |
+|---|---|---|
+| **K–8** | Arithmetic, fractions, decimals, percents, ratios, unit conversion, area/perimeter, mean/median/mode | Exact fractions (`Fraction`), `pint` for units. Word problems → Tier 2 |
+| **Algebra 1** | Linear equations/inequalities, systems, slope, exponents, polynomials, factoring, quadratics, radicals | `solveset`, `linsolve`, `factor`, `expand`; plug-in checks |
+| **Geometry** | Angles, triangles, Pythagorean theorem, trig ratios, circles, area/volume, coordinate geometry | Formula library plus SymPy. Problems needing values read off a figure → Tier 2 or review. Proofs → review |
+| **Algebra 2** | Polynomials, rational, exponential/log, sequences/series, complex numbers, matrices, conics, probability | Solve over complex numbers; check for extraneous roots and domains |
+| **Precalculus** | Trig identities and equations, inverse trig, polar/parametric, vectors, intro limits | `trigsimp`; random-point testing for identities; interval-aware solution sets |
+| **Calc AB / Calc 1** | Limits, derivatives, implicit differentiation, related rates, optimization, integrals, FTC | `limit`, `diff`, `idiff`, `integrate`; numerical double-checks (mpmath) |
+| **Calc BC / Calc 2** | Integration techniques, improper integrals, series, Taylor polynomials, polar/parametric calculus | `integrate`, `series`, `summation`; numeric partial sums and integrals |
+| **AP Stats** | Descriptive stats, regression, probability, distributions, CIs, hypothesis tests | SciPy/statsmodels recomputation from the data; tolerance for table values |
+| **Calc 3** | Vectors, partial derivatives, gradients, multiple and line/surface integrals | Iterated integrals in two orders; numeric integration cross-check |
+| **Diff Eqs** | Separable, linear, exact, 2nd order, Laplace, systems | `dsolve`, `laplace_transform`; **substitute the key's solution** into the equation; numeric ODE solve |
+
+**Expected coverage:** drill problems in Algebra through Calculus and Diff Eqs (most of a typical exercise set) are handled by Tier 1 with very high accuracy. Word problems, geometry figures, and stats scenarios depend on Tier 2 and will have a higher Needs review rate. Proofs and sketches are always Needs review.
+
+---
+
+## 9. Technology (all free)
+
+| Part | Tool |
+|---|---|
+| Language | Python 3.12 |
+| Local web page | **Streamlit**: one command (`math-verifier`) opens the app in your browser. Has drag-and-drop upload, page picker, and results tables built in |
+| PDF reading | PyMuPDF |
+| DOCX reading | python-docx (+ OMML→LaTeX conversion) |
+| Math OCR cross-check | pix2tex (LaTeX-OCR) or Texify, running locally |
+| Math parsing | SymPy parser, latex2sympy2 |
+| Solving | SymPy, SciPy, NumPy, mpmath, statsmodels, pint |
+| Local AI (optional) | Ollama + an open-source math model |
+| Install | `pip install` package, plus an optional Windows/Mac installer later |
+
+Safety: AI-written SymPy code runs in a separate process with a time limit, no network, and only math libraries allowed.
+
+---
+
+## 10. Proving accuracy
+
+1. **Test books:** free textbooks (OpenStax Prealgebra, Algebra 1/2, Precalculus, Calculus Vol. 1–3, Statistics, plus free K–8 and Diff Eq materials). Their keys serve as a starting ground truth.
+2. **Planted errors:** copy real keys and insert realistic mistakes (sign flips, dropped roots, bad rounding, missing `+C`, answers shifted by one, wrong letters). Measure how many are caught.
+3. **Equivalent-form tests:** thousands of pairs that must **not** be flagged (`1/2` vs `0.5`, `(x+1)²` vs `x²+2x+1`, alternate antiderivatives, alternate DE solution forms).
+4. **Targets, measured for each course:**
+   - Of the items flagged ❌, **≥ 99% are real errors** (precision)
+   - Of the real errors, **≥ 95% are caught** (recall) among problems that weren't sent to review
+   - Needs review rate is reported for each course so you know the coverage
+5. Every code change reruns these tests automatically.
+
+---
+
+## 11. Project layout
 
 ```
 math-solver/
-├── backend/
-│   ├── app/                 # FastAPI routes, job orchestration
-│   ├── ingest/              # pdf.py, docx.py, ocr.py, omml_to_latex.py, page_map.py
-│   ├── structure/           # problem_extractor.py, key_parser.py, aligner.py
+├── app.py                 # Streamlit UI: upload, page picker, results
+├── verifier/
+│   ├── ingest/            # pdf_reader.py, math_rebuild.py, docx_reader.py, ocr_check.py, page_numbers.py
+│   ├── extract/           # problems.py, instructions.py, answer_key.py, matcher.py
 │   ├── solve/
-│   │   ├── llm_solver.py    # multi-run reasoning solver
-│   │   ├── cas_solver.py    # LLM→SymPy code generation + sandboxed execution
-│   │   ├── verifiers/       # per-topic direct verification (algebra, calc, de, stats, …)
-│   │   └── router.py        # course/topic classification → strategy
-│   ├── compare/             # equivalence engine, confidence scoring, pattern detection
-│   ├── report/              # HTML/PDF/DOCX/CSV report generation
-│   ├── fix/                 # docx_editor.py (tracked changes), pdf_annotate.py, convert.py
-│   └── sandbox/             # isolated code runner
-├── frontend/                # React app: upload, page picker, dashboard, review
-├── eval/                    # benchmark datasets, seeded-error generator, metrics
-├── tests/
-├── docker/                  # Dockerfile with LibreOffice + Python stack
-└── PLAN.md
+│   │   ├── router.py      # picks Tier 1 / 2 / 3 and the course strategy
+│   │   ├── rules/         # Tier 1 instruction → SymPy handlers, one file per topic
+│   │   ├── local_ai.py    # Tier 2 (Ollama) translator + consistency checks
+│   │   ├── sandbox.py     # safe runner for generated code
+│   │   └── checks/        # direct key verification (plug-in, differentiate, checkodesol, …)
+│   ├── compare/           # equivalence engine, error-type diagnosis, shift detection
+│   └── report/            # on-screen report, PDF/CSV export
+├── eval/                  # test books, planted-error generator, accuracy metrics
+└── tests/
 ```
 
 ---
 
-## 11. Milestones
+## 12. Build order
 
-| Phase | Scope | Exit criteria |
+| Phase | What gets built | Done when |
 |---|---|---|
-| **0. Foundations** (1–2 wks) | Repo, Docker, FastAPI skeleton, sandbox, eval harness, first benchmark (Algebra 1 + K–8) | Harness runs end to end on a toy dataset |
-| **1. MVP: text PDFs, Algebra 1 + K–8** (3–4 wks) | PDF ingestion, page selection, problem/key extraction, alignment, LLM + CAS solve, equivalence engine, basic HTML report with "what's wrong / change to" | ❌ precision ≥ 99% on the benchmark for these courses |
-| **2. DOCX + scanned PDFs** (2–3 wks) | DOCX/OMML ingestion, OCR/vision path, figure extraction | Extraction accuracy ≥ 98% on the benchmark |
-| **3. Geometry, Algebra 2, Precalc** (3 wks) | Figure-aware solving, trig/complex/log verifiers, interval-aware comparison | Targets met for each course |
-| **4. Calculus (AB/BC/1/2/3)** (3–4 wks) | Limits/derivatives/integrals/series/multivariable verifiers | Targets met for each course |
-| **5. AP Stats + Diff Eqs** (2–3 wks) | Stats convention handling, ODE substitution verification, Laplace/systems | Targets met for each course |
-| **6. UI polish + review workflow** (2 wks) | Dashboard, side-by-side review, pattern detection, exports | Usability pass with real users |
-| **7. Nice-to-have: fix and convert** (2 wks) | DOCX tracked-change editing, PDF annotation, LibreOffice export | Round-trip tests show only the intended text changed |
+| **1. Skeleton** | Streamlit app, PDF upload, page picker with printed/PDF page numbers, test harness | Upload a PDF, choose pages, see them listed |
+| **2. Extraction** | Problem extraction, math rebuild from PDF layout, answer-key detection and matching | ≥ 98% of problems and key entries read correctly on test books |
+| **3. Algebra 1 + K–8 solving** | Tier 1 rules, equivalence engine, direct checks, report with error types and pages | ❌ precision ≥ 99% on planted-error tests |
+| **4. Algebra 2, Precalc, Geometry** | Trig, logs, complex, intervals, geometry formulas | Targets met for each course |
+| **5. Calculus (AB/BC/1/2/3) + Diff Eqs** | Limits, derivatives, integrals, series, multivariable, ODE checks | Targets met for each course |
+| **6. AP Stats** | Table/data extraction, stats recomputation, tolerances | Targets met |
+| **7. Local AI (Tier 2) + OCR cross-check** | Ollama integration, word-problem translation, math OCR double-read | Lower review rate without losing precision |
+| **8. Polish** | `.docx` input, PDF/CSV export, installer, shift detection and summaries | Ready for everyday use |
 
 ---
 
-## 12. Risks and mitigations
+## 13. Honest limits
 
-| Risk | Mitigation |
-|---|---|
-| Garbled math from PDF text layers | Vision transcript of every math-bearing crop, checked against the text layer; disagreements → 🔍 |
-| Wrong problem↔key alignment | Shift detection, section header anchoring, user confirmation of the key's page range |
-| LLM arithmetic or reasoning errors | Never rely on the LLM alone: CAS cross-check plus direct key verification plus multiple runs |
-| SymPy can't simplify or solve certain forms | Numeric random-point testing; alternate formulations; fall back to 🔍 rather than guess |
-| Book conventions (rounding, table values, exact vs decimal) | Parse instructions; per-book settings; stats tolerance bands; report as ⚠️ format issue, not ❌ |
-| Figure-dependent problems (geometry, graphs) | Figure extraction plus vision; when the figure is ambiguous → 🔍 |
-| Cost and time on large books | Cheaper model for extraction and triage, strong model only for solving and escalation; caching; parallel jobs; only selected pages |
-| Copyright / privacy of textbooks | Runs locally; only problem text and crops go to the API; no storage beyond the job unless the user opts in |
-| Running LLM-generated code | Sandbox with no network, CPU/memory/time limits, allow-listed imports |
-
----
-
-## 13. Open questions for the user
-
-1. **Where will it run?** Local desktop app/web app on your machine, or a hosted website for multiple users?
-2. **API budget:** is using a paid LLM API (Claude) and optionally Mathpix OK? Accuracy depends a lot on a strong model.
-3. **Typical inputs:** mostly digital PDFs from publishers, or scanned/photographed pages? Mostly DOCX worksheets you wrote yourself?
-4. **Strictness default:** if the key says `0.5` and the problem asks for a fraction, should that be ❌, ⚠️, or ✅?
-5. **Corrections in DOCX:** tracked changes (reviewable in Word) or clean replacement?
+- **Without a paid AI, word problems are the weak spot.** The free local model helps, but more of them will land in "Needs review" than with a top paid model. Drill-style problems (most textbook exercises) are not affected, since they're solved by exact computer algebra.
+- **Proofs, "explain your reasoning", and sketch-the-graph** answers can't be checked automatically. They're listed as Needs review with the page number.
+- **Scanned books** aren't supported in this version. Digital PDFs only.
