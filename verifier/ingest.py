@@ -77,6 +77,30 @@ def read_pdf(path_or_bytes, name: str = "document.pdf") -> Document:
 
 # ---------------------------------------------------------------- page reading
 
+def _vertical_rules(pg) -> list[tuple[float, float, float]]:
+    """Vertical lines (table cell borders): (x, y0, y1)."""
+    rules = []
+    try:
+        drawings = pg.get_drawings()
+    except Exception:
+        return rules
+    for d in drawings:
+        for item in d.get("items", []):
+            if item[0] == "l":
+                p1, p2 = item[1], item[2]
+                if abs(p1.x - p2.x) < 0.8 and abs(p2.y - p1.y) > 8:
+                    rules.append(((p1.x + p2.x) / 2, min(p1.y, p2.y), max(p1.y, p2.y)))
+            elif item[0] == "re":
+                r = item[1]
+                if r.width < 1.6 and r.height > 8:
+                    rules.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
+                elif r.width > 20 and r.height > 20 and d.get("color") is not None:
+                    # stroked rectangle (a table cell): its left and right edges are rules
+                    rules.append((r.x0, r.y0, r.y1))
+                    rules.append((r.x1, r.y0, r.y1))
+    return rules
+
+
 def _horizontal_rules(pg) -> list[tuple[float, float, float]]:
     """Short horizontal lines that could be fraction bars: (x0, x1, y)."""
     rules = []
@@ -117,7 +141,7 @@ def _split_span_by_baseline(span) -> list[dict]:
             continue
         out.append({
             "text": text, "size": span["size"], "flags": span["flags"],
-            "origin": run[0]["origin"],
+            "origin": run[0]["origin"], "chars": run,
             "bbox": (min(c["bbox"][0] for c in run), min(c["bbox"][1] for c in run),
                      max(c["bbox"][2] for c in run), max(c["bbox"][3] for c in run)),
         })
@@ -139,9 +163,33 @@ def _merge_same_baseline(raw_lines):
             groups[-1] = groups[-1] + spans
         else:
             groups.append(list(spans))
+    out = []
     for g in groups:
-        g.sort(key=lambda s: s["bbox"][0])
-    return groups
+        out.append(_insert_overlays(g))
+    return out
+
+
+def _insert_overlays(spans):
+    """A glyph drawn on top of a gap inside another span (e.g. the ∛ in 'Evaluate:  8') must be
+    placed at its position in the text: split the outer span around it."""
+    spans = sorted(spans, key=lambda s: s["bbox"][0])
+    for _ in range(10):
+        changed = False
+        for big in spans:
+            for small in spans:
+                if small is big or not small["text"].strip():
+                    continue
+                if big["bbox"][0] + 1 < small["bbox"][0] and small["bbox"][2] < big["bbox"][2] - 1:
+                    parts = _split_span_at(big, (small["bbox"][0] + small["bbox"][2]) / 2)
+                    if parts:
+                        spans = [x for x in spans if x is not big] + list(parts)
+                        changed = True
+                        break
+            if changed:
+                break
+        if not changed:
+            break
+    return sorted(spans, key=lambda s: s["bbox"][0])
 
 
 def _read_page(pg, index: int) -> Page:
@@ -162,9 +210,10 @@ def _read_page(pg, index: int) -> Page:
         raw_lines, _ = _rebuild_fractions(raw_lines, rules)
     raw_lines = _merge_same_baseline(raw_lines)
 
+    vrules = _vertical_rules(pg)
     page = Page(index=index, width=pg.rect.width, height=pg.rect.height)
     for spans in raw_lines:
-        for seg in _line_segments(spans):
+        for seg in _line_segments(spans, vrules):
             text = _spans_to_text(seg)
             if not text.strip():
                 continue
@@ -262,15 +311,47 @@ def _rebuild_fractions(raw_lines, rules):
     return out, out_frac
 
 
-def _line_segments(spans):
-    """Split a line where there is a large horizontal gap (separate columns)."""
+def _split_span_at(span, x: float):
+    """Split one span at page coordinate x (using its characters). Returns (left, right) or None."""
+    chars = span.get("chars") or []
+    left = [c for c in chars if (c["bbox"][0] + c["bbox"][2]) / 2 < x]
+    right = [c for c in chars if (c["bbox"][0] + c["bbox"][2]) / 2 >= x]
+    if not left or not right:
+        return None
+    def mk(cs):
+        return {"text": "".join(c["c"] for c in cs), "size": span["size"], "flags": span["flags"],
+                "origin": cs[0]["origin"], "chars": cs,
+                "bbox": (min(c["bbox"][0] for c in cs), min(c["bbox"][1] for c in cs),
+                         max(c["bbox"][2] for c in cs), max(c["bbox"][3] for c in cs))}
+    return mk(left), mk(right)
+
+
+def _line_segments(spans, vrules=()):
+    """Split a line where there is a large horizontal gap or a vertical rule (separate columns)."""
     spans = sorted(spans, key=lambda s: s["bbox"][0])
+    if vrules:
+        y0 = min(s["bbox"][1] for s in spans)
+        y1 = max(s["bbox"][3] for s in spans)
+        xs = sorted({round(x, 1) for (x, ry0, ry1) in vrules if ry0 <= (y0 + y1) / 2 <= ry1})
+        # a span that straddles a rule is split there
+        for x in xs:
+            out = []
+            for s in spans:
+                if s["bbox"][0] < x < s["bbox"][2]:
+                    parts = _split_span_at(s, x)
+                    out.extend(parts if parts else [s])
+                else:
+                    out.append(s)
+            spans = out
+    else:
+        xs = []
     segs, cur = [], [spans[0]]
     for s in spans[1:]:
         prev = cur[-1]
         gap = s["bbox"][0] - prev["bbox"][2]
         size = max(prev["size"], s["size"])
-        if gap > 3.0 * size:
+        ruled = any(prev["bbox"][2] - 1 <= x <= s["bbox"][0] + 1 for x in xs)
+        if gap > 3.0 * size or ruled:
             segs.append(cur)
             cur = [s]
         else:

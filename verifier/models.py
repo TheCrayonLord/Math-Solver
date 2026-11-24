@@ -66,15 +66,16 @@ class Problem:
     page_index: int
     printed_page: Optional[int]
     warnings: list[str] = field(default_factory=list)
+    group: Optional[str] = None  # how the answer key groups problems, e.g. "page 10"
 
     @property
     def key(self) -> tuple:
-        return (self.section, self.number, self.part)
+        return (self.group or self.section, self.number, self.part)
 
     @property
     def label(self) -> str:
         s = f"#{self.number}{self.part or ''}"
-        if self.section:
+        if self.section and not self.group:
             s = f"Section {self.section}, {s}"
         return s
 

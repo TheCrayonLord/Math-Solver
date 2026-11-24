@@ -2,18 +2,20 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+from dataclasses import replace as dc_replace
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from .choices import key_letter, split_choices
 from .compare import compare, numbers_equal
 from .models import (
     Document, KeyEntry, Problem, Result, VERDICT_CORRECT, VERDICT_INCOMPLETE, VERDICT_NO_KEY,
     VERDICT_REVIEW, VERDICT_UNREADABLE, VERDICT_WRONG,
 )
-from .solver import Unsupported, decimalize, solve_problem
-from .structure import extract_key, extract_problems, find_key_pages, match_key
+from .solver import Unreadable, Unsupported, decimalize, solve_problem
+from .structure import extract_key, extract_problems, find_key_pages, key_is_by_page, match_key
 
 TIMEOUT_SECONDS = 20
 
@@ -33,8 +35,14 @@ class Report:
 
 def check_one(problem: Problem, key: Optional[KeyEntry]) -> Result:
     """Solve one problem and compare with its key entry. Never raises."""
+    mc = split_choices(problem.text)
+    if mc:
+        return _check_multiple_choice(problem, key, *mc)
     try:
         sol = solve_problem(problem)
+    except Unreadable as exc:
+        return Result(problem, key, VERDICT_UNREADABLE, error_type="Math not readable",
+                      message=f"Couldn't read this problem: {exc}.")
     except Unsupported as exc:
         return Result(problem, key, VERDICT_REVIEW, error_type="Not solved automatically",
                       message=f"Not checked automatically: {exc}.")
@@ -67,6 +75,65 @@ def check_one(problem: Problem, key: Optional[KeyEntry]) -> Result:
     return res
 
 
+def _check_multiple_choice(problem: Problem, key: Optional[KeyEntry], stem: str, options: dict) -> Result:
+    try:
+        sol = solve_problem(dc_replace(problem, text=stem))
+    except Unsupported as exc:
+        return Result(problem, key, VERDICT_REVIEW, error_type="Not solved automatically",
+                      message=f"Not checked automatically: {exc}.")
+    except Exception as exc:  # noqa: BLE001
+        return Result(problem, key, VERDICT_REVIEW, error_type="Solver error",
+                      message=f"The solver hit an error on this problem ({type(exc).__name__}).")
+    matches = []
+    for letter, text in options.items():
+        try:
+            if compare(sol, text).verdict == VERDICT_CORRECT:
+                matches.append(letter)
+        except Exception:  # noqa: BLE001
+            pass
+    res = Result(problem, key, VERDICT_NO_KEY, computed=sol.display, steps=sol.steps, kind="choice")
+    if len(matches) == 1:
+        res.computed = f"{matches[0]} ({options[matches[0]]})"
+    if key is None:
+        res.message = "No answer for this problem in the answer key."
+        return res
+    if len(matches) != 1:
+        res.verdict = VERDICT_REVIEW
+        res.error_type = "Choices unclear"
+        res.message = (f"The answer is {sol.display}, but {'no' if not matches else 'more than one'} answer "
+                       f"choice matched it, so the key's choice couldn't be checked.")
+        return res
+    right = matches[0]
+    given = key_letter(key.answer)
+    if given is None:
+        res.verdict = VERDICT_REVIEW
+        res.error_type = "Key not understood"
+        res.message = f"Couldn't find a choice letter in the key's answer \"{key.answer}\". Correct choice: {res.computed}."
+        return res
+    if given == right:
+        # "A (x = −5)": if the key also writes out the answer, it must match the choice
+        m = re.match(r"^\s*\(?[A-E]\)?\s*\((.+)\)\s*\.?$", key.answer)
+        if m:
+            try:
+                c2 = compare(sol, m.group(1))
+            except Exception:  # noqa: BLE001
+                c2 = None
+            if c2 is not None and c2.verdict == VERDICT_WRONG:
+                res.verdict = VERDICT_WRONG
+                res.error_type = "Answer doesn't match its choice"
+                res.message = (f"The key's letter {given} is right, but the answer written next to it, "
+                               f"{m.group(1)}, is not choice {given} ({options[given]}). "
+                               f"Change it to {given} ({options[given]}).")
+                return res
+        res.verdict = VERDICT_CORRECT
+        return res
+    res.verdict = VERDICT_WRONG
+    res.error_type = "Wrong choice"
+    res.message = (f"The key says {given}" + (f" ({options[given]})" if given in options else "") +
+                   f", but the correct choice is {right} ({options[right]}), because the answer is {sol.display}.")
+    return res
+
+
 def _plain(v):
     """Make values picklable/comparable (sympy sets -> lists)."""
     import sympy as sp
@@ -86,6 +153,11 @@ def run(doc: Document, problem_pages: list[int], key_pages: Optional[list[int]] 
     key_set = set(key_pages)
     problem_pages = [p for p in problem_pages if p not in key_set]
     problems = extract_problems(doc, problem_pages)
+    entries = extract_key(doc, key_pages) if key_pages else []
+    if key_is_by_page(entries):
+        # key lists answers under "Page N" headings: problems are identified by their page
+        for p in problems:
+            p.group = f"page {p.printed_page if p.printed_page is not None else p.page_index + 1}"
     # The same number twice in one section (e.g. numbered steps in a worked example, then the
     # exercises): keep the last one, which is normally the exercise.
     last = {}
@@ -93,7 +165,6 @@ def run(doc: Document, problem_pages: list[int], key_pages: Optional[list[int]] 
         last[p.key] = p
     dropped = len(problems) - len(last)
     problems = [p for p in problems if last[p.key] is p]
-    entries = extract_key(doc, key_pages) if key_pages else []
     matched = match_key(problems, entries)
     tasks = [(p, matched.get(p.key)) for p in problems]
 
@@ -162,7 +233,7 @@ def _values_equal(a, b) -> bool:
 def _detect_shifts(report: Report) -> None:
     by_section: dict = {}
     for r in report.results:
-        by_section.setdefault(r.problem.section, []).append(r)
+        by_section.setdefault(r.problem.key[0], []).append(r)
     for section, rs in by_section.items():
         rs_sorted = sorted(rs, key=lambda r: (r.problem.number, r.problem.part or ""))
         wrong = [r for r in rs_sorted if r.verdict == VERDICT_WRONG and r.key_value is not None]
@@ -180,7 +251,8 @@ def _detect_shifts(report: Report) -> None:
         for off, group in offsets.items():
             if len(group) >= 3:
                 nums = sorted(g.problem.number for g in group)
-                where = f"Section {section}" if section else "The answer key"
+                where = (section[0].upper() + section[1:]) if section and section.startswith("page") else \
+                    (f"Section {section}" if section else "The answer key")
                 direction = "later" if off > 0 else "earlier"
                 report.notes.append(
                     f"{where}: the key answers for #{nums[0]}–#{nums[-1]} appear to be shifted — each one "
@@ -193,12 +265,13 @@ def _section_sanity(report: Report) -> None:
     """If almost every answer in a section disagrees, suspect a reading/matching problem, not the key."""
     by_section: dict = {}
     for r in report.results:
-        by_section.setdefault(r.problem.section, []).append(r)
+        by_section.setdefault(r.problem.key[0], []).append(r)
     for section, rs in by_section.items():
         compared = [r for r in rs if r.verdict in (VERDICT_CORRECT, VERDICT_WRONG, VERDICT_INCOMPLETE)]
         wrong = [r for r in compared if r.verdict == VERDICT_WRONG and r.error_type != "Key answers shifted"]
         if len(compared) >= 5 and len(wrong) / len(compared) > 0.6:
-            where = f"Section {section}" if section else "This document"
+            where = (section[0].upper() + section[1:]) if section and section.startswith("page") else \
+                (f"Section {section}" if section else "This document")
             report.notes.append(
                 f"{where}: {len(wrong)} of {len(compared)} answers disagree with the key. That usually means "
                 f"the key section was matched to the wrong problems or the page was misread, so these "

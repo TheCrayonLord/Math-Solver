@@ -175,6 +175,7 @@ def compare(sol: Solution, key_raw: str) -> Comparison:
             "number": _cmp_number, "percent": _cmp_number, "text": _cmp_text,
             "expr": _cmp_expr, "literal": _cmp_expr, "factor": _cmp_factor,
             "solutions": _cmp_solutions, "interval": _cmp_interval, "tuple": _cmp_tuple,
+            "stdev": _cmp_stdev,
         }[sol.kind]
     except KeyError:
         return Comparison(VERDICT_REVIEW, message=f"No comparison rule for answer type '{sol.kind}'.")
@@ -224,6 +225,23 @@ def _cmp_number(sol: Solution, key_raw: str) -> Comparison:
     if detail:
         msg += " " + detail
     return Comparison(VERDICT_WRONG, etype, msg, key_value=kv)
+
+
+def _cmp_stdev(sol: Solution, key_raw: str) -> Comparison:
+    """Books differ on population (÷n) vs sample (÷(n−1)) standard deviation: accept either."""
+    ans = parse_number_answer(key_raw)
+    pop, sample = sol.value
+    places = sol.places
+    raw = key_raw
+    if decimal_places(raw) is None and places is None:
+        # a whole-number key like "4" is a rounded value
+        places = 0
+    for v in (pop, sample):
+        if numbers_equal(v, ans.value, raw, places):
+            return Comparison(VERDICT_CORRECT, key_value=ans.value)
+    return Comparison(VERDICT_WRONG, "Wrong value",
+                      f"The key says {key_raw.strip()}, but the standard deviation is {sol.display}.",
+                      key_value=ans.value)
 
 
 def _unreduced_fraction(raw: str) -> Optional[str]:
@@ -365,6 +383,14 @@ def _cmp_solutions(sol: Solution, key_raw: str) -> Comparison:
                           f"The key lists {key_raw.strip()}, but the equation is true for "
                           f"{'all real numbers' if C == sp.S.Reals else pretty_set(C, name)}.", lines)
     computed = list(C) if isinstance(C, sp.FiniteSet) else []
+    dupes = False
+    uniq = []
+    for v in keyvals:  # "x = 6 or x = 6": the same value listed twice
+        if any(numbers_equal(v, u) for u in uniq):
+            dupes = True
+        else:
+            uniq.append(v)
+    keyvals = uniq
     unmatched, missing = _match_values(computed, keyvals, key_raw, sol.places)
     if not unmatched and not missing:
         return Comparison(VERDICT_CORRECT, key_value=keyvals)
@@ -378,9 +404,10 @@ def _cmp_solutions(sol: Solution, key_raw: str) -> Comparison:
     if not unmatched and missing:
         _, mlines = check(missing)
         miss = ", ".join(f"{name} = {pretty(v)}" for v in missing)
+        note = " (The key lists the same value twice — probably a sign was dropped.)" if dupes else ""
         return Comparison(VERDICT_INCOMPLETE, "Missing solution",
                           f"The key's answer is incomplete: it is missing {miss}. "
-                          f"All solutions: {sol.display}.", mlines, key_value=keyvals)
+                          f"All solutions: {sol.display}.{note}", mlines, key_value=keyvals)
     # some key values fail the plug-in check
     parts = []
     undefined = [v for v, st in bad if st == "undefined"]
@@ -493,6 +520,11 @@ def _cmp_tuple(sol: Solution, key_raw: str) -> Comparison:
                           f"The key's answer {key_raw.strip()} has a different number of values than expected.")
     if all(numbers_equal(c, k, key_raw, sol.places) for c, k in zip(sol.value, ans.value)):
         return Comparison(VERDICT_CORRECT, key_value=ans.value)
+    if not sol.equations:
+        # computed directly (e.g. a midpoint): there is nothing else the key could satisfy
+        return Comparison(VERDICT_WRONG, "Wrong point",
+                          f"The key says {key_raw.strip()}, but the correct answer is {sol.display}.",
+                          key_value=ans.value)
     status, lines = plug_in(sol.equations, dict(zip(sol.variables, ans.value)))
     if status == "ok":
         return Comparison(VERDICT_REVIEW, "Solver disagreement",

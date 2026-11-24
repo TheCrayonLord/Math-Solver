@@ -25,7 +25,8 @@ class Unsupported(Exception):
 
 NUM = r"-?\d+(?:,\d{3})*(?:\.\d+)?|-?\.\d+"
 LEAD_VERB_RE = re.compile(
-    r"^(?:solve(?:\s+(?:the|each)\s+(?:equation|inequality|system))?|simplify(?:\s+the\s+expression)?|"
+    r"^(?:solve(?:\s+(?:the|each)\s+(?:equation|inequality|system))?(?:\s+(?:by|using|with)\s+[a-z\s-]{3,40}?(?=:))?|"
+    r"simplify(?:\s+the\s+expression)?|"
     r"evaluate(?:\s+the\s+expression)?|factor(?:\s+completely)?|expand|multiply|add|subtract|divide|"
     r"compute|calculate|find\s+the\s+(?:sum|difference|product|quotient|value)(?:\s+of)?|find)\b"
     r"[\s:.,]*", re.I)
@@ -148,16 +149,32 @@ def h_gcf_lcm(text, instr, ctx) -> Optional[Solution]:
 
 def h_stats(text, instr, ctx) -> Optional[Solution]:
     low = ctx.lower()
-    kinds = [k for k in ("mean", "average", "median", "mode", "range") if re.search(rf"\b{k}\b", low)]
+    kinds = [k for k in ("mean", "average", "median", "mode", "range", "standard deviation")
+             if re.search(rf"\b{k}\b", low)]
     if "average" in kinds and "mean" in kinds:
         kinds.remove("average")
     if len(kinds) != 1:
         return None
-    m = re.search(r"(?:of|for)\s*:?\s*([-\d.,\s]+(?:and\s+-?[\d.]+)?)\s*\.?$", text)
-    nums = _number_list(m.group(1)) if m else _number_list(_strip_verb(text))
+    if re.search(r"interquartile|iqr|quartile|absolute deviation|percentile|five-number|weighted", low):
+        return None  # conventions differ between books: not checked automatically
+    m = re.search(r"(?:of|for|:)\s*:?\s*([-−\d.,\s]+(?:and\s+-?[\d.]+)?)\s*\.?$", text)
+    nums = _number_list(m.group(1).replace("−", "-")) if m else _number_list(_strip_verb(text))
     if not nums:
         return None
     k = kinds[0]
+    if k == "standard deviation":
+        n_ = len(nums)
+        mean = sum(nums) / n_
+        ss = sum((x - mean) ** 2 for x in nums)
+        pop = sp.sqrt(ss / n_)
+        sample = sp.sqrt(ss / (n_ - 1)) if n_ > 1 else pop
+        sol = Solution("stdev", (pop, sample), f"{pretty(sp.N(pop, 6))} (population) or "
+                       f"{pretty(sp.N(sample, 6))} (sample)",
+                       steps=[f"mean = {pretty(mean)}, sum of squared deviations = {pretty(ss)}",
+                              f"population σ = √({pretty(ss)}/{n_}) ≈ {sp.N(pop, 6)}",
+                              f"sample s = √({pretty(ss)}/{n_ - 1}) ≈ {sp.N(sample, 6)}"],
+                       method="standard deviation")
+        return sol
     data = sorted(nums)
     n = len(data)
     if k in ("mean", "average"):
@@ -201,6 +218,91 @@ def h_slope(text, instr, ctx) -> Optional[Solution]:
     return Solution("number", v, _fmt_number(v),
                     steps=[f"m = ({pretty(y2)} − ({pretty(y1)})) / ({pretty(x2)} − ({pretty(x1)})) = {pretty(v)}"],
                     method="slope")
+
+
+def h_points(text, instr, ctx) -> Optional[Solution]:
+    low = ctx.lower()
+    pts = POINT_RE.findall(normalize(text))
+    if len(pts) != 2 or not re.search(r"\b(distance|midpoint)\b", low):
+        return None
+    (x1, y1), (x2, y2) = [(parse_math(a), parse_math(b)) for a, b in pts]
+    if "midpoint" in low and "distance" not in low:
+        v = ((x1 + x2) / 2, (y1 + y2) / 2)
+        return Solution("tuple", v, pretty(v), variables=[sp.Symbol("x"), sp.Symbol("y")],
+                        steps=[f"(({pretty(x1)} + {pretty(x2)})/2, ({pretty(y1)} + {pretty(y2)})/2) = {pretty(v)}"],
+                        method="midpoint")
+    if "distance" in low and "midpoint" not in low:
+        d = sp.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        return Solution("number", d, pretty(d),
+                        steps=[f"d = √(({pretty(x2)} − {pretty(x1)})² + ({pretty(y2)} − {pretty(y1)})²) = {pretty(d)}"],
+                        method="distance")
+    return None
+
+
+LINE_EQ_RE = re.compile(r"((?:y\s*=\s*[^,;?]+?)|(?:[-−\d.\s]*x\s*[+\-−]\s*[\d.\s]*y\s*=\s*[-−\d./]+))(?=[,;?]|\s+(?:and|through|passing|that|at)\b|\.?\s*$)", re.I)
+
+
+def _line_slope(eq_text: str):
+    l, r = normalize(eq_text).split("=")
+    x, y = sp.Symbol("x"), sp.Symbol("y")
+    e = parse_math(l) - parse_math(r)
+    if sp.degree(e, y) != 1 or sp.degree(e, x) > 1:
+        return None
+    sol = sp.solve(e, y)
+    if len(sol) != 1:
+        return None
+    return sp.Poly(sol[0], x).coeff_monomial(x) if sol[0].has(x) else sp.Integer(0)
+
+
+def h_lines(text, instr, ctx) -> Optional[Solution]:
+    low = ctx.lower()
+    if not re.search(r"\b(parallel|perpendicular|slope|equation|line)\b", low):
+        return None
+    if re.search(r"\b(graph|shown|table|word|cost|each|ticket)\b", low):
+        return None
+    if re.search(r"parabola|vertex|quadratic|exponential|circle|curve|absolute value|function", low):
+        return None
+    t = normalize(text)
+    rel = re.search(r"(parallel|perpendicular)\s+to\s+(?:the\s+line\s+)?" + LINE_EQ_RE.pattern, t, re.I)
+    m = None
+    if rel:
+        m0 = _line_slope(rel.group(2))
+        if m0 is None:
+            return None
+        if rel.group(1).lower() == "parallel":
+            m = m0
+        else:
+            if m0 == 0:
+                return None  # perpendicular to horizontal: vertical line
+            m = -1 / m0
+    sm = re.search(rf"slope\s*(?:of|is|=|m\s*=)?\s*({NUM}(?:\s*/\s*\d+)?)", t, re.I)
+    if m is None and sm and not POINT_RE.search(t[:sm.start()] or "") and "through" in low:
+        m = parse_math(sm.group(1))
+    pts = POINT_RE.findall(t.replace(rel.group(0), " ") if rel else t)
+    pts = [(parse_math(a), parse_math(b)) for a, b in pts]
+    asks_equation = re.search(r"\b(write|find)\s+(?:an?\s+|the\s+)?equation", low)
+    if not asks_equation:
+        if rel and re.search(r"\bslope\b", low) and not pts:
+            return Solution("number", m, pretty(m), steps=[f"Slope of the given line: {pretty(m0)}; "
+                            f"{rel.group(1).lower()} slope: {pretty(m)}"], method="parallel/perpendicular slope")
+        return None
+    if m is None and len(pts) == 2:
+        (x1, y1), (x2, y2) = pts
+        if x1 == x2:
+            return None
+        m = (y2 - y1) / (x2 - x1)
+        pts = pts[:1]
+    if m is None or len(pts) != 1:
+        return None
+    if re.search(r"standard\s+form|point-slope", low):
+        return None  # form-specific answers: not compared yet
+    (px, py), = pts
+    x = sp.Symbol("x")
+    b = py - m * px
+    v = sp.expand(m * x + b)
+    return Solution("literal", v, f"y = {pretty(v)}", variables=[sp.Symbol("y")],
+                    steps=[f"slope m = {pretty(m)}", f"b = {pretty(py)} − ({pretty(m)})({pretty(px)}) = {pretty(b)}",
+                           f"y = {pretty(v)}"], method="equation of a line")
 
 
 FUNC_DEF_RE = re.compile(r"\b([fghkpq])\s*\(\s*([a-z])\s*\)\s*=\s*(.+?)(?:(?<!\d)[.;,](?!\d)|\s+(?:find|evaluate|what|and)\b|$)", re.I)
@@ -315,7 +417,8 @@ def _linear_steps(lhs, rhs, x) -> list[str]:
 
 def h_equation(text, instr, ctx) -> Optional[Solution]:
     t = _strip_verb(normalize(text))
-    m_for = re.search(r"solve\s+(?:\S+\s+){0,3}?for\s+([a-zA-Z])\b", ctx, re.I)
+    m_for = (re.search(r"\bfor\s+([a-zA-Z])\s*[.:]?\s*$", text.strip(), re.I)
+             or re.search(r"solve\s+for\s+([a-zA-Z])\b", ctx, re.I))
     t = re.sub(r"\s*,?\s*for\s+[a-zA-Z]\s*\.?$", "", t)
     if t.count("=") != 1 or re.search(r"[<>!]", t):
         return None
@@ -398,6 +501,8 @@ def h_expression(text, instr, ctx) -> Optional[Solution]:
     if re.search(r"[=<>]", t):
         return None
     e = parse_math(t)
+    if isinstance(e, sp.Symbol):
+        raise Unsupported("refers to a figure or diagram")
     if e.free_symbols:
         v = sp.simplify(e)
         if re.search(r"\b(expand|multiply|product)\b", ctx, re.I):
@@ -407,12 +512,19 @@ def h_expression(text, instr, ctx) -> Optional[Solution]:
     return Solution("number", v, pretty(v), steps=[f"= {pretty(v)}"], method="arithmetic")
 
 
-HANDLERS = [h_round, h_percent, h_gcf_lcm, h_stats, h_slope, h_function, h_evaluate,
+HANDLERS = [h_round, h_percent, h_gcf_lcm, h_stats, h_points, h_lines, h_slope, h_function, h_evaluate,
             h_system, h_factor, h_inequality, h_equation, h_expression]
+
+
+class Unreadable(Exception):
+    pass
 
 
 def solve_problem(problem: Problem) -> Solution:
     text = problem.text.strip()
+    text = re.sub(r"\s*=\s*(?:\?|_+)?\s*$", "", text)  # "(x + 9)(x − 2) =" means "work it out"
+    if not _strip_verb(text).strip(" .:;,"):
+        raise Unreadable("the math for this problem isn't text in the PDF (it may be drawn as a picture)")
     instr = problem.instruction.strip()
     ctx = f"{instr} {text}".strip()
     if re.search(r"\b(prove|explain|describe|graph|sketch|draw|justify|why)\b", ctx, re.I):

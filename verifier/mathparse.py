@@ -13,12 +13,12 @@ from sympy.parsing.sympy_parser import (
 
 TRANSFORMS = standard_transformations + (implicit_multiplication_application, convert_xor, rationalize)
 
-ALLOWED_WORDS = {"sqrt", "sin", "cos", "tan", "sec", "csc", "cot", "log", "ln", "abs", "pi", "oo",
+ALLOWED_WORDS = {"cbrt", "root4", "sqrt", "sin", "cos", "tan", "sec", "csc", "cot", "log", "ln", "abs", "pi", "oo",
                  "exp", "and", "or"}
 
 UNICODE_MAP = {
     "−": "-", "–": "-", "—": "-", "‒": "-", "×": "*", "·": "*", "⋅": "*", "∙": "*", "÷": "/",
-    "≤": "<=", "≥": ">=", "≦": "<=", "≧": ">=", "≠": "!=", "π": "pi", "∞": "oo",
+    "≤": "<=", "≥": ">=", "≦": "<=", "≧": ">=", "≠": "!=", "π": " pi ", "∞": "oo",
     "²": "^2", "³": "^3", "¹": "^1", "⁴": "^4", "⁵": "^5",
     "½": "(1/2)", "⅓": "(1/3)", "⅔": "(2/3)", "¼": "(1/4)", "¾": "(3/4)", "⅛": "(1/8)",
     "⁄": "/", "∕": "/", "′": "'", "’": "'", "“": '"', "”": '"', " ": " ",
@@ -52,10 +52,20 @@ def rounding_places(text: str) -> Optional[int]:
     return None
 
 
+SUPERSCRIPTS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺⁽⁾ⁿˣ", "0123456789-+()nx")
+SUBSCRIPTS = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
+
+
 def normalize(s: str) -> str:
+    s = re.sub(r"[⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺⁽⁾ⁿˣ]+",
+               lambda m: "^(" + m.group(0).translate(SUPERSCRIPTS) + ")", s)
+    s = re.sub(r"[₀₁₂₃₄₅₆₇₈₉]+", lambda m: "_" + m.group(0).translate(SUBSCRIPTS), s)
     for a, b in UNICODE_MAP.items():
         s = s.replace(a, b)
+    s = s.replace("∛", " cbrt ").replace("∜", " root4 ")
     s = s.replace("√", " sqrt ")
+    s = re.sub(r"(cbrt|root4)\s*(-?\d+(?:\.\d+)?|[a-zA-Z])(?![\w(])", r"\1(\2)", s)
+    s = re.sub(r"(cbrt|root4)\s*\(", r"\1(", s)
     # sqrt followed by a number/symbol without parentheses
     s = re.sub(r"sqrt\s*(\d+(?:\.\d+)?|[a-zA-Z])(?![\w(])", r"sqrt(\1)", s)
     s = re.sub(r"sqrt\s*\(", "sqrt(", s)
@@ -74,7 +84,8 @@ def normalize(s: str) -> str:
 
 
 def _symbols_in(s: str) -> dict:
-    d = {"e": sp.E, "pi": sp.pi, "sqrt": sp.sqrt, "Abs": sp.Abs, "abs": sp.Abs,
+    d = {"e": sp.E, "pi": sp.pi, "sqrt": sp.sqrt, "cbrt": lambda x: sp.real_root(x, 3),
+         "root4": lambda x: sp.real_root(x, 4), "Abs": sp.Abs, "abs": sp.Abs,
          "ln": sp.log, "log": sp.log, "oo": sp.oo, "E": sp.E, "I": sp.Symbol("I"),
          "S": sp.Symbol("S"), "N": sp.Symbol("N"), "Q": sp.Symbol("Q"), "O": sp.Symbol("O"),
          "C": sp.Symbol("C")}
@@ -84,11 +95,31 @@ def _symbols_in(s: str) -> dict:
     return d
 
 
+# Short English words that must not be read as products of variables (e.g. "is" = i·s)
+STOP_WORDS = set("""a an and are as at be by can cost costs do does each for from had has have he her his
+how if in is it its many more much not of on or per she sum than that the then them they this to total
+was we were what when who why will with you your old new let use how all any one two six ten
+find solve each than less more same make made take gets got buy buys sell sold""".split())
+
+
 def check_words(s: str) -> None:
-    """Raise if the text contains English words (it isn't pure math)."""
-    for w in re.findall(r"[A-Za-z]{2,}", s):
-        if w.lower() not in ALLOWED_WORDS and w != "Abs":
+    """Raise if the text contains English words (it isn't pure math).
+
+    Short letter runs like 'lw', 'Prt' or 'IR' are products of variables, as written in algebra.
+    """
+    for m in re.finditer(r"[A-Za-z]{2,}", s):
+        w = m.group(0)
+        lw = w.lower()
+        if lw in ALLOWED_WORDS or w == "Abs":
+            continue
+        if len(w) >= 5:
             raise ParseError(f"contains words ('{w}')")
+        if lw in STOP_WORDS:
+            # a stop word next to another word is English ("x is 5"); inside math ("u + at") it's a product
+            before = s[:m.start()].rstrip()
+            after = s[m.end():].lstrip()
+            if (before and before[-1].isalpha()) or (after and after[0].isalpha()):
+                raise ParseError(f"contains words ('{w}')")
 
 
 def parse_math(s: str, evaluate: bool = True) -> sp.Expr:
@@ -142,7 +173,7 @@ class Answer:
     var: Optional[str] = None
 
 
-NO_SOLUTION_RE = re.compile(r"^(?:no\s+(?:real\s+)?solutions?|none|no\s+real\s+(?:roots|numbers)|"
+NO_SOLUTION_RE = re.compile(r"^(?:no\s+(?:real\s+)?solutions?|none|no\s+real\s+solutions?|no\s+real\s+(?:roots|numbers)|"
                             r"\{\s*\}|empty\s+set|∅|inconsistent)\.?$", re.I)
 ALL_REALS_RE = re.compile(r"^(?:all\s+real\s+numbers|infinitely\s+many(?:\s+solutions)?|"
                           r"identity|every\s+real\s+number|\(\s*-oo\s*,\s*oo\s*\)|"
@@ -189,6 +220,8 @@ def split_top_level(s: str, seps=(",", ";")) -> list[str]:
 def _clean(raw: str) -> str:
     s = normalize(raw).strip()
     s = re.sub(r"^(?:answer|ans)\s*[:.]\s*", "", s, flags=re.I)
+    # remarks in parentheses: "all real numbers (infinitely many solutions)", "none (discriminant -12)"
+    s = re.sub(r"\s*\((?=[^()]*[A-Za-z]{4,})[^()]*\)\s*$", "", s)
     s = s.strip().rstrip(".").strip()
     s = s.replace("$", "")
     return s
@@ -218,13 +251,11 @@ def parse_expr_answer(raw: str) -> Answer:
 
 
 def _expand_pm(piece: str) -> list[str]:
-    if "±" in piece or "+-" in piece or "+/-" in piece:
-        p = piece.replace("+/-", "±").replace("+-", "±")
-        a, b = p.split("±", 1)
-        if not a.strip():
-            return [f"({b})", f"-({b})"]
-        return [f"{a}+({b})", f"{a}-({b})"]
-    return [piece]
+    """'(−3 ± √65)/4' -> ['(−3 + √65)/4', '(−3 - √65)/4']"""
+    p = piece.replace("+/-", "±").replace("+-", "±")
+    if "±" in p:
+        return _expand_pm(p.replace("±", "+", 1)) + _expand_pm(p.replace("±", "-", 1))
+    return [p]
 
 
 def parse_solution_set(raw: str) -> Answer:

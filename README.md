@@ -70,6 +70,14 @@ Grades K–8 and Algebra 1:
 - literal equations ("solve for y"), inequalities (including compound), and 2–3 variable systems
 - simplifying, expanding, and factoring, with checks for "completely factored"
 - evaluating expressions and functions, and the slope through two points
+- radicals including cube roots, distance and midpoint, parallel/perpendicular slopes,
+  equations of lines (slope-intercept), and standard deviation (population or sample)
+- multiple choice: checks the key's letter and that any answer written next to it matches
+
+Layouts it understands: section-numbered books ("3.2", "Lesson 3-2"), keys organized by page
+("Page 10 · Multi-Step Equations"), two-column pages, worksheet tables and grids, `1.` or `1)`
+numbering, answers that wrap onto the next line, and example boxes and "Answer: ____" blanks,
+which are ignored.
 
 The next phases add Geometry, Algebra 2, Precalculus, Calculus (AB/BC/1/2/3), AP Statistics, and
 Differential Equations. See [PLAN.md](PLAN.md).

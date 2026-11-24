@@ -22,8 +22,12 @@ KEY_HEADING_RE = re.compile(
     r"(?:\s+(?:key|to\s+.*|section))?\s*$|^answer\s+key\b", re.I)
 END_OF_KEY_RE = re.compile(r"^(?:index|glossary|credits|appendix)\b", re.I)
 
-NUM_START_RE = re.compile(r"^(\d{1,3})\s*[.)]\s+(.*)$")
-NUM_SPLIT_RE = re.compile(r"(?:(?<=\s)|^)(\d{1,3})\s*([.)])\s+")
+NUM_START_RE = re.compile(r"^(\d{1,3})\s*[.)](?:\s+(.*)|$)")
+NUM_SPLIT_RE = re.compile(r"(?:(?<=\s)|^)(\d{1,3})\s*([.)])(?:\s+|$)")
+KEY_PAGE_SECTION_RE = re.compile(r"^page\s+(\d{1,4})\b", re.I)
+# lines that are never part of a problem: blanks to write on, worked-example steps, headers
+NOISE_RE = re.compile(r"^(?:(?:answer|name|date|score|class|period)\s*:?\s*_{2,}.*|_{3,}|step\s+\d+\b.*)$", re.I)
+EXAMPLE_RE = re.compile(r"^(?:example|worked example|model problem)\b\s*\d*\s*:?\s*$", re.I)
 PART_SPLIT_RE = re.compile(r"(?:(?<=\s)|^)(?:\(([a-h])\)|([a-h])[.)])\s+")
 
 INSTRUCTION_VERBS = (
@@ -100,23 +104,32 @@ def _split_numbered(text: str, last_num: Optional[int]) -> list[tuple[int, str]]
     if not matches or matches[0].start() != 0:
         return []
     delim = matches[0].group(2)
-    accepted = []
-    prev = last_num
-    for m in matches:
-        n = int(m.group(1))
-        if m.start() != 0 and (m.group(2) != delim or delim == ")" and text[m.start() - 1:m.start()] != " "):
+    first = matches[0]
+    n0 = int(first.group(1))
+    cands = []
+    for m in matches[1:]:
+        if m.group(2) != delim:
             continue
-        if m.start() != 0 and not (prev is not None and prev < n <= prev + 4):
-            continue
-        if m.start() == 0 or prev is None or prev < n <= prev + 12:
-            if accepted and n <= accepted[-1][0]:
-                continue
-            if m.start() != 0 and accepted == [] and prev is None:
-                continue
-            accepted.append((n, m))
-            prev = n
-    if not accepted or accepted[0][1].start() != 0:
-        return []
+        before = text[:m.start()].rstrip()
+        if before and before[-1] in "+-−*/=(^·×÷,":
+            continue  # "(m + 5) …": the 5) is inside an expression that wrapped
+        if m.end() == len(text) and m.group(2) == ".":
+            continue  # "… of 6 and 8." ends a sentence; a bare "11)" at the end starts a wrapped item
+        cands.append((int(m.group(1)), m))
+    accepted = [(n0, first)]
+    prev = n0
+    while True:
+        later = [(n, m) for n, m in cands if m.start() > accepted[-1][1].start()]
+        nxt = None
+        for step in (1, 2, 3, 4):  # prefer the very next number (odd-only keys skip one)
+            hits = [(n, m) for n, m in later if n == prev + step]
+            if hits:
+                nxt = hits[0]
+                break
+        if nxt is None:
+            break
+        accepted.append(nxt)
+        prev = nxt[0]
     out = []
     for i, (n, m) in enumerate(accepted):
         end = accepted[i + 1][1].start() if i + 1 < len(accepted) else len(text)
@@ -136,12 +149,41 @@ def _scan(doc: Document, page_indices: list[int], key_mode: bool):
         last_by_col: dict[int, _Item] = {}
         last_num_by_col: dict[int, Optional[int]] = {}
         pending_instr: Optional[_Marker] = None
+        in_example = False
         for line in page.lines:
-            text = line.text.strip()
+            text = re.sub(r"\s*_{3,}\s*", " ", line.text).strip()
             col = _col(line, page)
-            if key_mode and KEY_HEADING_RE.match(text):
+            if not text or NOISE_RE.match(line.text.strip()):
                 continue
-            sec = section_from_text(text)
+            if key_mode:
+                if KEY_HEADING_RE.match(text):
+                    continue
+                # "Try more 1) n = 12", "Your turn: n = 5", "Secret word: EQUATION"
+                text = re.sub(r"\b(?:try\s+more|practice|exercise)\s+(?=\d{1,3}\))", "", text, flags=re.I)
+                text = re.sub(r"\s*\bsecret\s+(?:word|message|code)\s*:.*$", "", text, flags=re.I)
+                text = re.sub(r"\s*\b(?:try\s+more|your\s+turn:?)\s*$", "", text, flags=re.I)
+                if re.match(r"^(?:your\s+turn|you\s+try|check)\s*:", text, re.I):
+                    m1 = re.search(r"(?:(?<=\s)|^)1\s*[.)]\s", text)
+                    text = text[m1.start():].strip() if m1 else ""
+                text = re.sub(r"\s+\b(?:your\s+turn|you\s+try)\s*:\s*\S.*?(?=\s\d{1,3}\)|$)", "", text, flags=re.I)
+                if not text:
+                    continue
+            if not key_mode:
+                if EXAMPLE_RE.match(text):
+                    in_example = True
+                    continue
+                if in_example:
+                    if NUM_START_RE.match(text):
+                        in_example = False
+                    else:
+                        continue  # worked example: not a problem, not directions
+            sec = None
+            if key_mode:
+                m = KEY_PAGE_SECTION_RE.match(text)
+                if m:
+                    sec = f"page {int(m.group(1))}"
+            if sec is None:
+                sec = section_from_text(text)
             if sec is not None and not NUM_START_RE.match(text):
                 markers.append(_Marker("section", sec, pi, line.y0, line.x0, line.x1, col))
                 last_by_col.pop(col, None)
@@ -164,13 +206,35 @@ def _scan(doc: Document, page_indices: list[int], key_mode: bool):
                     pending_instr = _Marker("instruction", text, pi, line.y0, line.x0, line.x1, col)
                     markers.append(pending_instr)
                 continue
-            # continuation of the previous item in this column
-            prev = last_by_col.get(col)
-            if prev is not None and 0 <= line.y0 - prev.last_y < 2.2 * line.size \
-                    and line.x0 >= prev.x0 - 5:
-                prev.text += " " + text
+            # continuation of the item just above this line (same column / grid cell)
+            prev = None
+            for cand in page_items:
+                if 0 <= line.y0 - cand.last_y < 2.2 * line.size and cand.x0 - 5 <= line.x0 \
+                        and (line.x0 < cand.x1 or line.x0 - cand.x0 < 40):
+                    # ties (several items split from one line): the last one continues
+                    if prev is None or cand.last_y > prev.last_y or \
+                            (cand.last_y == prev.last_y and cand.x0 >= prev.x0):
+                        prev = cand
+            if prev is not None:
                 prev.last_y = line.y1
                 prev.has_fraction = prev.has_fraction or line.has_fraction
+                more = []
+                if key_mode:
+                    for delim in (")", "."):
+                        cand = _split_numbered(f"{prev.number}{delim} {prev.text} {text}".strip(),
+                                               prev.number - 1)
+                        if len(cand) > len(more):
+                            more = cand
+                if len(more) > 1 and more[0][0] == prev.number:
+                    # an answer list that wrapped onto the next line: "... 11)" / "k = −9  12) ..."
+                    prev.text = more[0][1]
+                    for n, body in more[1:]:
+                        it = _Item(n, body, pi, line.y0, line.x0, line.x1, line.y1, line.has_fraction)
+                        page_items.append(it)
+                        last_by_col[col] = it
+                        last_num_by_col[col] = n
+                else:
+                    prev.text = (prev.text + " " + text).strip()
             elif pending_instr is not None and line.y0 - pending_instr.y < 3 * line.size \
                     and not key_mode and not page_items:
                 pending_instr.value += " " + text
@@ -273,6 +337,8 @@ def find_key_pages(doc: Document) -> list[int]:
 def extract_problems(doc: Document, page_indices: list[int]) -> list[Problem]:
     problems = []
     for it in _scan(doc, page_indices, key_mode=False):
+        if re.search(r"\bAnswer\s*:\s*[^\s_]", it.text):
+            continue  # a worked solution ("... Answer: x = 4"), not an exercise
         printed = doc.pages[it.page].printed
         stem, parts = _split_parts(it.text)
         warnings = []
@@ -303,6 +369,14 @@ def extract_key(doc: Document, page_indices: list[int]) -> list[KeyEntry]:
     return entries
 
 
+def key_is_by_page(entries: list[KeyEntry]) -> bool:
+    """True when the key is organized by the page each problem is on ('Page 10 · ...')."""
+    if not entries:
+        return False
+    by_page = sum(1 for e in entries if e.section and e.section.startswith("page "))
+    return by_page / len(entries) > 0.5
+
+
 def match_key(problems: list[Problem], entries: list[KeyEntry]) -> dict[tuple, KeyEntry]:
     """Map problem.key -> KeyEntry."""
     by_key = {}
@@ -315,11 +389,12 @@ def match_key(problems: list[Problem], entries: list[KeyEntry]) -> dict[tuple, K
 
     out = {}
     for p in problems:
-        e = by_key.get((p.section, p.number, p.part))
+        grp = p.key[0]
+        e = by_key.get((grp, p.number, p.part))
         if e is None and p.part is None:
             # whole-problem key for a problem without parts
-            e = by_key.get((p.section, p.number, None))
-        if e is None and (not key_has_sections or p.section is None):
+            e = by_key.get((grp, p.number, None))
+        if e is None and (not key_has_sections or grp is None):
             cands = by_num.get((p.number, p.part), [])
             if len(cands) == 1:
                 e = cands[0]

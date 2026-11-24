@@ -211,3 +211,55 @@ def test_docx_worksheet(tmp_path):
     rep = run(doc, list(range(len(doc.pages))), workers=0)
     v = {r.problem.number: r.verdict for r in rep.results}
     assert v == {1: VERDICT_CORRECT, 2: VERDICT_CORRECT, 3: VERDICT_INCOMPLETE}
+
+
+def test_repeated_value_means_missing_solution():
+    c = verdict("x^2 = 36", "x = 6 or x = 6")
+    assert c.verdict == VERDICT_INCOMPLETE and "−6" not in c.message and "-6" in c.message
+
+
+def test_multiple_choice():
+    from verifier.models import KeyEntry
+    from verifier.pipeline import check_one
+    p = P("Simplify: √27 + √12 A 6√3 B 5√6 C 8√3 D 5√3")
+    k = lambda a: KeyEntry(None, 1, None, a, 0, 1)  # noqa: E731
+    assert check_one(p, k("D (5√3)")).verdict == VERDICT_CORRECT
+    assert check_one(p, k("D")).verdict == VERDICT_CORRECT
+    r = check_one(p, k("A (6√3)"))
+    assert r.verdict == VERDICT_WRONG and "correct choice is D" in r.message
+    r = check_one(p, k("D (6√3)"))
+    assert r.verdict == VERDICT_WRONG and r.error_type == "Answer doesn't match its choice"
+    # an equation with a variable named A is not a choice list
+    from verifier.choices import split_choices
+    assert split_choices("Solve A = lw for w.") is None
+
+
+@pytest.mark.parametrize("text,key", [
+    ("Find the median: 15, 16, 31, 31, 32", "31"),
+    ("Find the distance between (5, 4) and (−3, 19).", "17"),
+    ("Find the midpoint of (2, 4) and (6, −2).", "(4, 1)"),
+    ("What is the slope of a line perpendicular to y = 5x − 3?", "−1/5"),
+    ("Write an equation in slope-intercept form for the line through (5, 6) perpendicular to y = (5/3)x − 2.", "y = −(3/5)x + 9"),
+    ("Write an equation of the line through (1, 2) and (3, 8).", "y = 3x − 1"),
+    ("Solve by substitution: x − 2y = −12 and −5x + 3y = −3", "(6, 9)"),
+    ("Solve with the quadratic formula: 3x² + 17x + 20 = 0", "x = −4 or x = −5/3"),
+    ("Find the standard deviation: 27, 27, 32, 33, 34, 36, 36, 39", "4"),
+    ("Evaluate: ∛−8", "−2"),
+])
+def test_more_problem_types(text, key):
+    c = verdict(text, key)
+    assert c.verdict == VERDICT_CORRECT, c.message
+
+
+def test_line_equation_wrong():
+    c = verdict("Write an equation of the line through (1, 2) and (3, 8).", "y = 3x + 1")
+    assert c.verdict == VERDICT_WRONG
+
+
+@pytest.mark.parametrize("text", [
+    "Write the equation of a parabola with vertex (−4, 5) that passes through (−1, 23).",
+    "Find the interquartile range (IQR): 18, 22, 31, 31, 36, 44, 47, 47, 59",
+])
+def test_lookalike_problems_are_not_guessed(text):
+    with pytest.raises(Unsupported):
+        solve_problem(P(text))
