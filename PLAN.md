@@ -1,5 +1,10 @@
 # Math Answer-Key Verifier — Project Plan (v2)
 
+> **Status:** Phases 1–3 are built (app, PDF/.docx reading, page selection, problem and answer-key
+> extraction, K–8 + Algebra 1 solving, equivalence engine, page-exact error reports). See README.md.
+> Tested on a generated sample book with planted key errors. Next: phase 4 (Algebra 2, Precalc,
+> Geometry), plus testing on real textbooks.
+
 ## 1. Goal
 
 A free program that runs on your own computer. You drop in a **digital PDF** (or `.docx`) of a math book or worksheet, pick which pages to check (or all), and the program:
@@ -251,9 +256,9 @@ math-solver/
 
 | Phase | What gets built | Done when |
 |---|---|---|
-| **1. Skeleton** | Streamlit app, PDF upload, page picker with printed/PDF page numbers, test harness | Upload a PDF, choose pages, see them listed |
-| **2. Extraction** | Problem extraction, math rebuild from PDF layout, answer-key detection and matching | ≥ 98% of problems and key entries read correctly on test books |
-| **3. Algebra 1 + K–8 solving** | Tier 1 rules, equivalence engine, direct checks, report with error types and pages | ❌ precision ≥ 99% on planted-error tests |
+| **1. Skeleton** ✅ | Streamlit app, PDF upload, page picker with printed/PDF page numbers, test harness | Upload a PDF, choose pages, see them listed |
+| **2. Extraction** ✅ | Problem extraction, math rebuild from PDF layout, answer-key detection and matching | ≥ 98% of problems and key entries read correctly on test books |
+| **3. Algebra 1 + K–8 solving** ✅ | Tier 1 rules, equivalence engine, direct checks, report with error types and pages | ❌ precision ≥ 99% on planted-error tests |
 | **4. Algebra 2, Precalc, Geometry** | Trig, logs, complex, intervals, geometry formulas | Targets met for each course |
 | **5. Calculus (AB/BC/1/2/3) + Diff Eqs** | Limits, derivatives, integrals, series, multivariable, ODE checks | Targets met for each course |
 | **6. AP Stats** | Table/data extraction, stats recomputation, tolerances | Targets met |
